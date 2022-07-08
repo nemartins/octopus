@@ -422,7 +422,207 @@ PolycloneCaller::call_variants(const std::vector<Variant>& candidates, const Lat
     }
     return transform_calls(sample(), std::move(variant_calls), std::move(genotype_calls), haplotype_frequency_stats);
 }
+// BEGIN - reference genotype calling
 
+namespace {
+
+// reference genotype calling
+
+struct RefCall
+{
+    Allele reference_allele;
+    Phred<double> posterior;
+};
+
+const GenomicRegion& mapped_region(const GenotypeProbabilityMap& genotype_posteriors)
+{
+    return mapped_region(std::cbegin(genotype_posteriors)->first);
+}
+
+bool contains_helper(const Haplotype& haplotype, const Allele& allele)
+{
+    if (!is_indel(allele)) {
+        return haplotype.contains(allele);
+    } else {
+        return haplotype.includes(allele);
+    }
+}
+
+bool has_variation(const Allele& allele, const GenotypeProbabilityMap& genotype_posteriors)
+{
+    return !genotype_posteriors.empty()
+        && contains(mapped_region(genotype_posteriors), allele)
+        && !all_of_is_homozygous(std::cbegin(genotype_posteriors), std::cend(genotype_posteriors), allele,
+                                 [] (const auto& p) { return p.first; });
+}
+
+auto marginalise_homozygous(const Allele& allele, const GenotypeProbabilityMap& genotype_log_posteriors)
+{
+    std::deque<double> buffer {};
+    for_each_is_homozygous(std::cbegin(genotype_log_posteriors), std::cend(genotype_log_posteriors), allele,
+                           [&] (const auto& p, bool is_hom) { if (!is_hom) buffer.push_back(p.second); },
+                           [] (const auto& p) { return p.first; });
+    if (!buffer.empty()) {
+        return log_probability_false_to_phred(std::min(maths::log_sum_exp(buffer), 0.0));
+    } else {
+        return Phred<> {std::numeric_limits<double>::infinity()};
+    }
+}
+
+using ReadPileupRange = ContainedRange<ReadPileups::const_iterator>;
+
+auto compute_homozygous_posterior(const Allele& allele,
+                                  const GenotypeProbabilityMap& genotype_posteriors,
+                                  const GenotypeProbabilityMap& genotype_log_posteriors,
+                                  const ReadPileupRange& pileups,
+                                  int ploidy)
+{
+    assert(!empty(pileups));
+    if (has_variation(allele, genotype_posteriors)) {
+        return marginalise_homozygous(allele, genotype_log_posteriors);
+    } else {
+        std::vector<AlignedRead::BaseQuality> reference_qualities {}, non_reference_qualities {};
+        Allele::NucleotideSequence reference_sequence {};
+        std::size_t reference_idx {0};
+        for (const ReadPileup& pileup : pileups) {
+            reference_sequence.assign(1, allele.sequence()[reference_idx++]);
+            pileup.summaries([&] (const auto& sequence, const auto& summaries) {
+                if (sequence == reference_sequence) {
+                    for (const auto& summary : summaries) {
+                        for (const auto base_quality : summary.base_qualities) {
+                            reference_qualities.push_back(std::min(base_quality, summary.mapping_quality));
+                        }
+                    }
+                } else if (sequence.size() != reference_sequence.size()) {
+                    // indel
+                    constexpr ReadPileup::BaseQuality indel_base_quality {30};
+                    for (const auto& summary : summaries) {
+                        non_reference_qualities.push_back(std::min(indel_base_quality, summary.mapping_quality));
+                    }
+                } else {
+                    // snv/mnv
+                    for (const auto& summary : summaries) {
+                        for (const auto base_quality : summary.base_qualities) {
+                            non_reference_qualities.push_back(std::min(base_quality, summary.mapping_quality));
+                        }
+                    }
+                }
+            });
+        }
+        const auto depth = reference_qualities.size() + non_reference_qualities.size();
+        if (depth == 0) return Phred<double> {3.0};
+        for (auto& q : reference_qualities) q = std::max(q, AlignedRead::BaseQuality {1});
+        for (auto& q : non_reference_qualities) q = std::max(q, AlignedRead::BaseQuality {1});
+        std::vector<double> reference_ln_likelihoods(depth), non_reference_ln_likelihoods(depth);
+        const auto phred_to_ln = [] (auto phred) { return phred * -maths::constants::ln10Div10<>; };
+        const auto phred_to_not_ln = [] (auto phred) { return std::log(1.0 - std::pow(10.0, -phred / 10.0)); };
+
+        // Compute reference_ln_likelihoods = Pr(read | ref)
+        auto itr = std::transform(std::cbegin(reference_qualities), std::cend(reference_qualities),
+                                  std::begin(reference_ln_likelihoods), phred_to_not_ln);
+        std::transform(std::cbegin(non_reference_qualities), std::cend(non_reference_qualities), itr, phred_to_ln);
+
+        // Compute non_reference_ln_likelihoods = Pr(read | alt)
+        itr = std::transform(std::cbegin(reference_qualities), std::cend(reference_qualities),
+                             std::begin(non_reference_ln_likelihoods), phred_to_ln);
+        std::transform(std::cbegin(non_reference_qualities), std::cend(non_reference_qualities), itr, phred_to_not_ln);
+
+        // Compute logs of possible values for allele fractions: log(k/p) for k = 0,1,...,ploidy.
+        double log_0 = -std::numeric_limits<double>::infinity();
+        std::vector<double> mixture_fraction(ploidy+1);
+        for(int k=0; k < ploidy; k++)
+            mixture_fraction[k] = (k==0) ? log_0 : std::log(double(k)/ploidy);
+
+        std::vector<double> likelihood_for_n_ref_alleles(ploidy+1);
+        for(int k=0; k <= ploidy; k++)
+        {
+            // Pr(all reads at site | ref*k + alt*(ploidy-k)) = \prod_r Pr(read[r] | ref*k + alt*(ploidy-k))
+            double product = 0;
+            for(long unsigned int r=0; r < depth; r++)
+            {
+                // Pr(read | ref*k + alt*(ploidy-k)) = (k/ploidy)*Pr(read|ref) + ((ploidy-k)/k)*Pr(read|alt)
+                double x = mixture_fraction[k] + reference_ln_likelihoods[r];
+                double y = mixture_fraction[ploidy-k] + non_reference_ln_likelihoods[r];
+                product += maths::log_sum_exp(x,y);
+            }
+            likelihood_for_n_ref_alleles[k] = product;
+        }
+
+        // This conversion of likelihoods to probability assumes a uniform prior on mixture fractions,
+        // This is like assuming a uniform prior on allele frequencies in the population.
+        // This differs from a uniform distribution on GENOTYPES, which would weigh heavily against
+        //    homozygosity as ploidy increases.
+
+        double hom_ref_ln_likelihood = likelihood_for_n_ref_alleles[ploidy];
+
+        auto non_hom_ref_ln_likelihoods = likelihood_for_n_ref_alleles[0];
+        for(int k=1; k < ploidy; k++)
+            non_hom_ref_ln_likelihoods = maths::log_sum_exp(non_hom_ref_ln_likelihoods, likelihood_for_n_ref_alleles[k]);
+
+        const auto non_hom_ref_ln_posterior = non_hom_ref_ln_likelihoods - maths::log_sum_exp(hom_ref_ln_likelihood, non_hom_ref_ln_likelihoods);
+        return log_probability_false_to_phred(non_hom_ref_ln_posterior);
+    }
+}
+
+auto call_reference(const std::vector<Allele>& reference_alleles,
+                    const GenotypeProbabilityMap& genotype_posteriors,
+                    const GenotypeProbabilityMap& genotype_log_posteriors,
+                    const ReadPileups& pileups,
+                    int ploidy)
+{
+    assert(std::is_sorted(std::cbegin(reference_alleles), std::cend(reference_alleles)));
+    std::vector<RefCall> result {};
+    result.reserve(reference_alleles.size());
+    auto active_pileup_itr = std::cbegin(pileups);
+    for (const auto& allele : reference_alleles) {
+        const auto active_pileups = contained_range(active_pileup_itr, std::cend(pileups), contig_region(allele));
+        const auto posterior = compute_homozygous_posterior(allele, genotype_posteriors, genotype_log_posteriors, active_pileups, ploidy);
+        result.push_back({allele, posterior});
+        active_pileup_itr = active_pileups.end().base();
+    }
+    return result;
+}
+
+auto transform_calls(std::vector<RefCall>&& calls, const SampleName& sample, const unsigned ploidy)
+{
+    std::vector<std::unique_ptr<ReferenceCall>> result {};
+    result.reserve(calls.size());
+    std::transform(std::make_move_iterator(std::begin(calls)), std::make_move_iterator(std::end(calls)),
+                   std::back_inserter(result),
+                   [&] (auto&& call) {
+                       std::map<SampleName, ReferenceCall::GenotypeCall> genotype {{sample, {ploidy, call.posterior}}};
+                       return std::make_unique<ReferenceCall>(std::move(call.reference_allele), call.posterior, std::move(genotype));
+                   });
+    return result;
+}
+
+} // namespace
+
+std::vector<std::unique_ptr<ReferenceCall>>
+PolycloneCaller::call_reference(const std::vector<Allele>& alleles,
+                                 const Caller::Latents& latents,
+                                 const ReadPileupMap& pileups) const
+{
+    return call_reference(alleles, dynamic_cast<const Latents&>(latents), pileups);
+}
+
+std::vector<std::unique_ptr<ReferenceCall>>
+PolycloneCaller::call_reference(const std::vector<Allele>& alleles,
+                                 const Latents& latents,
+                                 const ReadPileupMap& pileups) const
+{
+    int ploidy = 1;
+    if (latents.model_log_posteriors_.subclonal > latents.model_log_posteriors_.subclonal)
+        ploidy = latents.polyploid_genotypes_.front().ploidy();
+
+    const auto& genotype_posteriors = (*latents.genotype_posteriors())[sample()];
+    const auto& genotype_log_posteriors = (*latents.genotype_log_posteriors())[sample()];
+    auto calls = octopus::call_reference(alleles, genotype_posteriors, genotype_log_posteriors,
+                                         pileups.at(sample()), ploidy);
+    return transform_calls(std::move(calls), sample(), ploidy);
+}
+
+// END - reference genotype calling
 std::vector<std::unique_ptr<ReferenceCall>>
 PolycloneCaller::call_reference(const std::vector<Allele>& alleles, const Caller::Latents& latents, const ReadPileupMap& pileup) const
 {
