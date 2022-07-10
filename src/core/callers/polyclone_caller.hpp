@@ -138,6 +138,7 @@ public:
     
     std::shared_ptr<HaplotypeProbabilityMap> haplotype_posteriors() const noexcept override;
     std::shared_ptr<GenotypeProbabilityMap> genotype_posteriors() const noexcept override;
+    std::shared_ptr<GenotypeProbabilityMap> genotype_log_posteriors() const noexcept;
 
 private:
     GenotypeBlock haploid_genotypes_, polyploid_genotypes_;
